@@ -13,6 +13,9 @@ names are off). The name label is an admin toggle, on by default, and reads in
 the admin's chosen language(s); it packs as part of its bird, tucked up under
 the silhouette, so a name can never land on a neighbour or clip.
 
+Size and centrality are one number, not two: whatever makes a bird bigger also
+places it earlier on the spiral. What feeds that number is sizes.py's business.
+
 Nothing here rolls dice per render: a species holds its artwork for as long as
 it is in the window (picks.py) and the mirror is a hash of the name, so a bird
 is unaffected by which other birds are on the page, or by a restart.
@@ -24,14 +27,14 @@ import hashlib
 import logging
 import math
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageFilter
 
-from ..names import image_for
+from ..names import drawable_keys, image_for, normalize
 from ..picks import Picks
 from ..source import Source
 from . import fonts
@@ -46,7 +49,7 @@ from .page import (
     trim,
 )
 from .paper import PAD, process_sprite
-from .sizes import SIZE_EXPONENT, mass_of
+from .sizes import SIZE_EXPONENT, TIER_STEP, mass_of
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +59,21 @@ DEFAULT_RESOLUTION = (1280, 800)
 # panel and the kiosk on different pages.
 _PACK_SHORT = 1200
 _MARGIN = 0.04  # page edge to content on short side. Hardcoded now, maybe add configurability?
-_MAX_BIRDS = 40  # keeps the render quick, not the page tidy
+# The frame's own ceiling whatever the admin asks for: a render is ~90% packing
+# and the Pi has to finish it. Keeps the render quick, not the page tidy.
+MAX_BIRDS = 40
+
+# How many species the admin lets on, and which ones (#53). NO_LIMIT still means
+# "every bird the window holds", not "however long the Pi takes to draw them".
+NO_LIMIT = 0
+LIMIT_OPTIONS = (NO_LIMIT, 5, 8, 10, 12, 15, 20, 30)
+RANK_MOST_HEARD = "heard"
+RANK_RAREST = "rarest"
+RANKINGS = {
+    RANK_MOST_HEARD: "The most heard",
+    RANK_RAREST: "The rarest",  # at a busy station the visitor is the interesting one
+}
+DEFAULT_RANKING = RANK_MOST_HEARD
 _ALPHA_CUTOFF = 24
 _OVERLAP_PX = 2  # erode the collision mask slightly so birds nestle into
 # each other's (invisible on paper) halos. No rotation:
@@ -207,12 +224,26 @@ def _flip(name: str) -> bool:
     return hashlib.blake2b(name.encode(), digest_size=1).digest()[0] < 128
 
 
-def _size_weights(names: list[str]) -> list[float]:
-    """Per-bird display weight from real mass, centered on the present set's
-    geometric mean and compressed by SIZE_EXPONENT."""
+def _geometric(values: list[float]) -> float:
+    return math.exp(sum(math.log(v) for v in values) / len(values))
+
+
+def _size_weights(names: list[str], tiers: Mapping[str, int]) -> list[float]:
+    """Per-bird display weight from real mass, optionally multiplied by how often
+    the bird has been heard (`tiers`; empty means mass alone).
+
+    Each factor is divided by the set's geometric mean, so it only ever says how
+    a bird compares to its neighbours. That is what keeps the two composable and
+    keeps `base`, which sizes the cluster to the page, from drifting.
+    """
     masses = [mass_of(n) for n in names]
-    geo = math.exp(sum(math.log(m) for m in masses) / len(masses))
-    return [(m / geo) ** SIZE_EXPONENT for m in masses]
+    geo = _geometric(masses)
+    weights = [(m / geo) ** SIZE_EXPONENT for m in masses]
+    if not tiers:
+        return weights
+    heard = [float(TIER_STEP ** tiers.get(n, 0)) for n in names]
+    loud = _geometric(heard)
+    return [w * h / loud for w, h in zip(weights, heard, strict=True)]
 
 
 def _layout(
@@ -277,6 +308,7 @@ def _placements(
     key: tuple,
     arts: list[Image.Image],
     names: list[str],
+    tiers: Mapping[str, int],
     flips: list[bool],
     width: int,
     height: int,
@@ -293,10 +325,11 @@ def _placements(
         if hit is not None:
             return hit
 
-        # Each bird's target size scales with its real mass (compressed); the whole
-        # set then overshoots and shrinks to the first fit that fills the canvas.
-        # Placing biggest-first on the center-out spiral keeps large birds central.
-        weights = _size_weights(names)
+        # Each bird's target size scales with its real mass (compressed), and
+        # optionally with how often it was heard; the whole set then overshoots
+        # and shrinks to the first fit. Biggest-first on the spiral keeps the
+        # birds that earned the most size central.
+        weights = _size_weights(names, tiers)
         order = sorted(range(len(names)), key=lambda i: -weights[i])
         base = min(
             math.sqrt(width * height * 1.5 / sum(w * w for w in weights)),
@@ -344,6 +377,7 @@ def render_collage(
     label_size: str = fonts.DEFAULT_LABEL_SIZE,
     label_text: Callable[[str], str] = str,
     perches: Sequence[Path] = (),
+    tiers: Mapping[str, int] | None = None,
 ) -> Image.Image:
     """Composite the given (name, image) entries into a tightly packed collage.
 
@@ -351,10 +385,12 @@ def render_collage(
     would otherwise turn the grain into noise. It also picks the label ink.
     label_text: scientific name -> what the label reads; str leaves it alone.
     perches: the active style's bare branches, for a page with no birds on it.
+    tiers: how often each species was heard, in bands (sizes.count_tiers);
+    empty sizes the page by body mass alone, which is the default.
     """
     canvas = blank(resolution, textured)
 
-    kept = [(name, path) for name, path in entries if path is not None][:_MAX_BIRDS]
+    kept = [(name, path) for name, path in entries if path is not None][:MAX_BIRDS]
     if not kept:
         draw_perch(canvas, perches, day_ordinal(), textured)
         return canvas
@@ -365,6 +401,8 @@ def render_collage(
     width, height = round(resolution[0] / scale), round(resolution[1] / scale)
 
     names = [name for name, _ in kept]
+    # Narrowed to the birds actually drawn; the window's bands cover more.
+    heard = {name: tiers[name] for name in names if name in tiers} if tiers else {}
     flips = [_flip(name) for name in names]
     name_px = label_px(width, height, label_size)
     labels = tuple(label_text(name) for name in names) if show_names else None
@@ -375,11 +413,14 @@ def render_collage(
         font_key if show_names else None,
         name_px,
         labels,
+        # In the key because they change the sizes, and so the whole packing.
+        tuple(sorted(heard.items())),
     )
     placed, used_px = _placements(
         key,
         arts,
         names,
+        heard,
         flips,
         width,
         height,
@@ -413,19 +454,57 @@ def _at(at: tuple[int, int], scale: float) -> tuple[int, int]:
     return round(at[0] * scale), round(at[1] * scale)
 
 
+def _rank(ranking: str):
+    """Sort key that puts the birds the admin asked to keep first. Ties break on
+    the name, so a page at its limit does not flicker between two equal birds."""
+    if ranking == RANK_RAREST:
+        return lambda pair: (pair[1], pair[0])
+    return lambda pair: (-pair[1], pair[0])
+
+
+def selected_species(
+    source: Source,
+    images_dir: Path,
+    style: str,
+    hours: int = 24,
+    limit: int = NO_LIMIT,
+    ranking: str = DEFAULT_RANKING,
+) -> list[str]:
+    """The species that make the page, in name order.
+
+    Name order because the order birds are handed over must not depend on their
+    counts - a bird merely heard again would reshuffle the whole packing. Which
+    birds are on it does depend on the counts once a limit is set, so the page's
+    key is built from this same list.
+
+    The ranking only applies under a limit, as the admin says: with none set the
+    frame's own ceiling keeps the most heard, whatever the greyed-out field holds.
+
+    What the style cannot draw is dropped before the limit, so a plate the frame
+    does not have never takes one of the places. One directory listing, not a
+    probe per species: the loop asks for this on every poll, and so does the
+    kiosk.
+    """
+    keys = drawable_keys(images_dir, style)
+    counted = [(name, n) for name, n in source.species_since(hours) if normalize(name) in keys]
+    if limit == NO_LIMIT:
+        limit, ranking = MAX_BIRDS, DEFAULT_RANKING
+    ranked = sorted(counted, key=_rank(ranking))
+    return sorted(name for name, _n in ranked[: min(limit, MAX_BIRDS)])
+
+
 def gather_entries(
     source: Source,
     images_dir: Path,
     style: str,
     picks: Picks,
     hours: int = 24,
+    limit: int = NO_LIMIT,
+    ranking: str = DEFAULT_RANKING,
 ) -> list[tuple[str, Path | None]]:
-    """Recent-window species paired with the artwork each is wearing, or None.
-
-    In name order, matching the collage's cache key: the page is a function of
-    the species set alone, so a count moving must not reshuffle the layout.
-    """
+    """The page's species paired with the artwork each is wearing. The None only
+    stands for a file that vanished between `selected_species` and here."""
     return [
         (name, image_for(name, images_dir, style, picks))
-        for name, _count in sorted(source.species_since(hours))
+        for name in selected_species(source, images_dir, style, hours, limit, ranking)
     ]
